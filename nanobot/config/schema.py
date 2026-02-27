@@ -226,6 +226,7 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     max_tool_iterations: int = 40
     memory_window: int = 100
+    memory_model: str | None = None
 
 
 class AgentsConfig(Base):

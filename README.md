@@ -674,6 +674,26 @@ Config file: `~/.nanobot/config.json`
 | `openai_codex` | LLM (Codex, OAuth) | `nanobot provider login openai-codex` |
 | `github_copilot` | LLM (GitHub Copilot, OAuth) | `nanobot provider login github-copilot` |
 
+### Optimization: Fast Memory Consolidation
+
+If your main model is slow (e.g., DeepSeek-R1, large local models, or "thinking" models), you can configure a separate, faster model specifically for background memory consolidation.
+
+Set `memoryModel` in `~/.nanobot/config.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "deepseek/deepseek-r1",
+      "memoryModel": "google/gemini-2.0-flash-001",
+      "memoryWindow": 100
+    }
+  }
+}
+```
+
+This ensures that while you chat with a powerful reasoning model, the background work of summarizing history happens in seconds using a lightweight model like Gemini Flash or GPT-4o-mini.
+
 <details>
 <summary><b>OpenAI Codex (OAuth)</b></summary>
 
