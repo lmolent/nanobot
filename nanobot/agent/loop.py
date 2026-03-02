@@ -397,7 +397,7 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=chat_id,
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started (previous context archived in background).")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -471,10 +471,17 @@ class AgentLoop:
                     lock = self._consolidation_locks.setdefault(key, asyncio.Lock())
                     try:
                         async with lock:
-                            await self._consolidate_memory(session)
+                            if await self._consolidate_memory(session):
+                                # Cleanup history: remove messages that have been consolidated
+                                # We keep the messages that were just consolidated but within the window,
+                                # as defined by last_consolidated index.
+                                logger.info("Cleaning up history for session {}: keeping messages from {}", key, session.last_consolidated)
+                                if session.last_consolidated > 0:
+                                    session.messages = list(session.messages[session.last_consolidated:])
+                                    session.last_consolidated = 0
                     finally:
                         self._consolidating.discard(key)
-                        # Save session state after consolidation
+                        # Save session state after consolidation and cleanup
                         self.sessions.save(session)
                 
                 # Yield to other tasks
