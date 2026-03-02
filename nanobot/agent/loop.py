@@ -276,11 +276,20 @@ class AgentLoop:
                 await self._background_maintenance()
                 continue
 
-            # Cancel background maintenance immediately when a message arrives
+            # Cancel all background consolidation tasks immediately when a message arrives
             if self._maintenance_task and not self._maintenance_task.done():
                 self._maintenance_task.cancel()
                 self._maintenance_task = None
                 logger.debug("Background maintenance cancelled (new message)")
+
+            cancelled_count = 0
+            for t in list(self._consolidation_tasks):
+                if not t.done():
+                    t.cancel()
+                    cancelled_count += 1
+            if cancelled_count:
+                self._consolidation_tasks.clear()
+                logger.debug("Cancelled {} active consolidation tasks", cancelled_count)
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
@@ -389,10 +398,17 @@ class AgentLoop:
                     try:
                         logger.info("Archiving session {} in background...", session.key)
                         await self._consolidate_memory(temp_session, archive_all=True)
+                    except asyncio.CancelledError:
+                        logger.debug("Background archival for {} cancelled", session.key)
                     except Exception:
                         logger.exception("Background archival failed for {}", session.key)
+                    finally:
+                        _task = asyncio.current_task()
+                        if _task is not None:
+                            self._consolidation_tasks.discard(_task)
 
-                asyncio.create_task(_archive_task())
+                _task = asyncio.create_task(_archive_task())
+                self._consolidation_tasks.add(_task)
 
             session.clear()
             self.sessions.save(session)
@@ -469,20 +485,28 @@ class AgentLoop:
                     logger.info("Background consolidation for session {} ({} messages)", key, unconsolidated)
                     self._consolidating.add(key)
                     lock = self._consolidation_locks.setdefault(key, asyncio.Lock())
-                    try:
-                        async with lock:
-                            if await self._consolidate_memory(session):
-                                # Cleanup history: remove messages that have been consolidated
-                                # We keep the messages that were just consolidated but within the window,
-                                # as defined by last_consolidated index.
-                                logger.info("Cleaning up history for session {}: keeping messages from {}", key, session.last_consolidated)
-                                if session.last_consolidated > 0:
-                                    session.messages = list(session.messages[session.last_consolidated:])
-                                    session.last_consolidated = 0
-                    finally:
-                        self._consolidating.discard(key)
-                        # Save session state after consolidation and cleanup
-                        self.sessions.save(session)
+                    
+                    async def _async_consolidate(s=session, k=key, l=lock):
+                        try:
+                            async with l:
+                                if await self._consolidate_memory(s):
+                                    logger.info("Cleaning up history for session {}: keeping messages from {}", k, s.last_consolidated)
+                                    if s.last_consolidated > 0:
+                                        s.messages = list(s.messages[s.last_consolidated:])
+                                        s.last_consolidated = 0
+                        except asyncio.CancelledError:
+                            logger.debug("Consolidation for {} cancelled", k)
+                        except Exception:
+                            logger.exception("Error in background consolidation for {}", k)
+                        finally:
+                            self._consolidating.discard(k)
+                            self.sessions.save(s)
+                            _task = asyncio.current_task()
+                            if _task is not None:
+                                self._consolidation_tasks.discard(_task)
+
+                    _task = asyncio.create_task(_async_consolidate())
+                    self._consolidation_tasks.add(_task)
                 
                 # Yield to other tasks
                 await asyncio.sleep(0.1)
