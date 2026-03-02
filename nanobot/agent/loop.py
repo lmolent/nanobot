@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -110,6 +111,12 @@ class AgentLoop:
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+
+        # Maintenance & Idle tracking
+        self._maintenance_task: asyncio.Task | None = None
+        self._last_interaction_at: dict[str, float] = {}  # session_key -> timestamp
+        self._maintenance_interval = 60.0  # seconds
+
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -264,9 +271,16 @@ class AgentLoop:
 
         while self._running:
             try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=5.0)
             except asyncio.TimeoutError:
+                await self._background_maintenance()
                 continue
+
+            # Cancel background maintenance immediately when a message arrives
+            if self._maintenance_task and not self._maintenance_task.done():
+                self._maintenance_task.cancel()
+                self._maintenance_task = None
+                logger.debug("Background maintenance cancelled (new message)")
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
@@ -274,6 +288,7 @@ class AgentLoop:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
                 task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -341,6 +356,7 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
+            self._last_interaction_at[key] = time.time()
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
@@ -358,58 +374,34 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        self._last_interaction_at[key] = time.time()
 
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
-            finally:
-                self._consolidating.discard(session.key)
+            # Archive current session messages in background before clearing
+            snapshot = list(session.messages[session.last_consolidated:])
+            if snapshot:
+                temp_session = Session(key=f"archive:{session.key}:{time.time()}")
+                temp_session.messages = snapshot
+                
+                async def _archive_task():
+                    try:
+                        logger.info("Archiving session {} in background...", session.key)
+                        await self._consolidate_memory(temp_session, archive_all=True)
+                    except Exception:
+                        logger.exception("Background archival failed for {}", session.key)
+
+                asyncio.create_task(_archive_task())
 
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+            return OutboundMessage(channel=msg.channel, chat_id=chat_id,
+                                  content="New session started (previous context archived in background).")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
-
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-
-            async def _consolidate_and_unlock():
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -451,6 +443,47 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
+
+    async def _background_maintenance(self) -> None:
+        """Trigger background maintenance if not already running."""
+        if self._maintenance_task and not self._maintenance_task.done():
+            return
+        self._maintenance_task = asyncio.create_task(self._run_maintenance())
+
+    async def _run_maintenance(self) -> None:
+        """Background task to consolidate memory for idle sessions."""
+        try:
+            # Wait for some idle time before starting heavy consolidation
+            await asyncio.sleep(self._maintenance_interval)
+            
+            # Check all active/cached sessions
+            now = time.time()
+            for key, session in list(self.sessions._cache.items()):
+                # Only consolidate if idle for enough time
+                last_active = self._last_interaction_at.get(key, 0)
+                if now - last_active < self._maintenance_interval:
+                    continue
+
+                unconsolidated = len(session.messages) - session.last_consolidated
+                if unconsolidated >= self.memory_window and key not in self._consolidating:
+                    logger.info("Background consolidation for session {} ({} messages)", key, unconsolidated)
+                    self._consolidating.add(key)
+                    lock = self._consolidation_locks.setdefault(key, asyncio.Lock())
+                    try:
+                        async with lock:
+                            await self._consolidate_memory(session)
+                    finally:
+                        self._consolidating.discard(key)
+                        # Save session state after consolidation
+                        self.sessions.save(session)
+                
+                # Yield to other tasks
+                await asyncio.sleep(0.1)
+
+        except asyncio.CancelledError:
+            logger.debug("Maintenance task cancelled")
+        except Exception:
+            logger.exception("Error in background maintenance")
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
